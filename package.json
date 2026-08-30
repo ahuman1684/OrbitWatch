@@ -1,0 +1,23 @@
+{
+  "name": "orbitwatch",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Space Debris Tracking & Conjunction Risk Prediction Dashboard",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "cesium": "^1.114.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "satellite.js": "^5.0.0"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.3.1",
+    "vite": "^5.4.0",
+    "vite-plugin-cesium": "^1.2.23"
+  }
+}

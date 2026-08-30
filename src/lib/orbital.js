@@ -1,0 +1,399 @@
+import * as satellite from 'satellite.js';
+import * as Cesium from 'cesium';
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Live orbital data — CelesTrak GP (TLE) API, no auth required.
+// Each group is capped for performance: conjunction detection is O(pairs),
+// and debris fields in particular cluster tightly in altitude, so raw object
+// count (not just pair count) is the thing to keep in check.
+//
+// URLs are routed through /celestrak-proxy (see vite.config.js) rather than
+// hitting celestrak.org directly — CelesTrak doesn't send CORS headers, so a
+// direct browser fetch fails silently into the cache/empty fallback path.
+// ─────────────────────────────────────────────────────────────────────────────
+const CELESTRAK_GROUPS = [
+  // Fengyun-1C has no named GROUP (unlike the other two breakup fields below)
+  // — query by international designator instead, which returns the parent
+  // object plus every cataloged fragment from the same launch/breakup.
+  { key: 'fengyun',  type: 'debris',    cap: 15, url: '/celestrak-proxy/gp.php?INTDES=1999-025&FORMAT=3LE' },
+  { key: 'cosmos',   type: 'debris',    cap: 15, url: '/celestrak-proxy/gp.php?GROUP=cosmos-2251-debris&FORMAT=3LE' },
+  { key: 'iridium',  type: 'debris',    cap: 15, url: '/celestrak-proxy/gp.php?GROUP=iridium-33-debris&FORMAT=3LE' },
+  { key: 'starlink', type: 'satellite', cap: 40, url: '/celestrak-proxy/gp.php?GROUP=starlink&FORMAT=3LE' },
+  // Crewed stations (ISS, Tiangong, ...) and science satellites (Hubble, ...)
+  // — so live "satellite" mode isn't just Starlink clones.
+  { key: 'stations', type: 'satellite', cap: 15, url: '/celestrak-proxy/gp.php?GROUP=stations&FORMAT=3LE' },
+  { key: 'science',  type: 'satellite', cap: 15, url: '/celestrak-proxy/gp.php?GROUP=science&FORMAT=3LE' },
+];
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Fixed demo dataset — 10 satellites (3 shells: Starlink-like, station-like,
+// sun-synchronous) + 20 debris (3 real historical fields: Cosmos 2251,
+// Iridium 33, Fengyun-1C), each spread around its orbit with fixed (not
+// random-per-load) RAAN/mean-anomaly offsets so the layout is reproducible.
+// A few pairs are deliberately near-duplicated to guarantee close approaches
+// — verified against the real conjunction-detection algorithm before baking
+// in: SIM-IRIDIUM-A/D at 1.92 km (critical), SIM-COSMOS-A/B at 6.84 km and
+// SIM-FENGYUN-A/B at 4.63 km (both warning). Same TLE-epoch convention
+// (1 Jan 2024) as the rest of the app so time-anchoring stays correct.
+// ─────────────────────────────────────────────────────────────────────────────
+export const DEMO_TLES = [
+  ['SIM-STARLINK-A', '1 44713U 19074A   24001.50000000  .00001764  00000+0  13559-3 0  9991', '2 44713  53.0530  45.5210 0001420  80.2650 279.8530 15.06427812 21', 'satellite'],
+  ['SIM-STARLINK-B', '1 44713U 19074A   24001.50000000  .00001764  00000+0  13559-3 0  9991', '2 44713  53.0530  90.5210 0001420  80.2650 339.8530 15.06427812 21', 'satellite'],
+  ['SIM-STARLINK-C', '1 44713U 19074A   24001.50000000  .00001764  00000+0  13559-3 0  9991', '2 44713  53.0530 175.5210 0001420  80.2650 119.8530 15.06427812 21', 'satellite'],
+  ['SIM-STARLINK-D', '1 44713U 19074A   24001.50000000  .00001764  00000+0  13559-3 0  9991', '2 44713  53.0530 255.5210 0001420  80.2650 219.8530 15.06427812 21', 'satellite'],
+  ['SIM-STATION-A', '1 25544U 98067A   24001.50000000  .00016717  00000+0  10270-3 0  9993', '2 25544  51.6400 337.6640 0007776  35.4780 324.6830 15.50377579 10', 'satellite'],
+  ['SIM-STATION-B', '1 25544U 98067A   24001.50000000  .00016717  00000+0  10270-3 0  9993', '2 25544  51.6400  67.6640 0007776  35.4780  84.6830 15.50377579 10', 'satellite'],
+  ['SIM-STATION-C', '1 25544U 98067A   24001.50000000  .00016717  00000+0  10270-3 0  9993', '2 25544  51.6400 227.6640 0007776  35.4780 204.6830 15.50377579 10', 'satellite'],
+  ['SIM-TERRA-A', '1 25994U 99068A   24001.50000000  .00000013  00000+0  13700-4 0  9995', '2 25994  98.2100 344.0400 0001400  93.4100 266.7200 14.57160013  5', 'satellite'],
+  ['SIM-TERRA-B', '1 25994U 99068A   24001.50000000  .00000013  00000+0  13700-4 0  9995', '2 25994  98.2100  84.0400 0001400  93.4100 356.7200 14.57160013  5', 'satellite'],
+  ['SIM-TERRA-C', '1 25994U 99068A   24001.50000000  .00000013  00000+0  13700-4 0  9995', '2 25994  98.2100 204.0400 0001400  93.4100 176.7200 14.57160013  5', 'satellite'],
+  ['SIM-COSMOS-A', '1 34454U 93036RV  24001.50000000  .00000300  00000+0  47800-4 0  9991', '2 34454  74.0200 183.4500 0083200 278.9700  80.2400 14.50234501  3', 'debris'],
+  ['SIM-COSMOS-B', '1 34454U 93036RV  24001.50000000  .00000300  00000+0  47800-4 0  9991', '2 34454  74.0200 183.4700 0083200 278.9700  80.2900 14.50234501  3', 'debris'],
+  ['SIM-COSMOS-C', '1 34454U 93036RV  24001.50000000  .00000300  00000+0  47800-4 0  9991', '2 34454  74.0200 243.4500 0083200 278.9700 160.2400 14.50234501  3', 'debris'],
+  ['SIM-COSMOS-D', '1 34454U 93036RV  24001.50000000  .00000300  00000+0  47800-4 0  9991', '2 34454  74.0200 313.4500 0083200 278.9700 240.2400 14.50234501  3', 'debris'],
+  ['SIM-COSMOS-E', '1 34454U 93036RV  24001.50000000  .00000300  00000+0  47800-4 0  9991', '2 34454  74.0200  23.4500 0083200 278.9700 320.2400 14.50234501  3', 'debris'],
+  ['SIM-COSMOS-F', '1 34454U 93036RV  24001.50000000  .00000300  00000+0  47800-4 0  9991', '2 34454  74.0200  93.4500 0083200 278.9700  20.2400 14.50234501  3', 'debris'],
+  ['SIM-COSMOS-G', '1 34454U 93036RV  24001.50000000  .00000300  00000+0  47800-4 0  9991', '2 34454  74.0200 153.4500 0083200 278.9700 100.2400 14.50234501  3', 'debris'],
+  ['SIM-IRIDIUM-A', '1 33766U 97051CA  24001.50000000  .00000420  00000+0  65200-4 0  9997', '2 33766  86.3900 260.1700 0013400 317.8900  42.1200 14.50199002  3', 'debris'],
+  ['SIM-IRIDIUM-B', '1 33766U 97051CA  24001.50000000  .00000420  00000+0  65200-4 0  9997', '2 33766  86.3900 315.1700 0013400 317.8900 112.1200 14.50199002  3', 'debris'],
+  ['SIM-IRIDIUM-C', '1 33766U 97051CA  24001.50000000  .00000420  00000+0  65200-4 0  9997', '2 33766  86.3900  10.1700 0013400 317.8900 192.1200 14.50199002  3', 'debris'],
+  ['SIM-IRIDIUM-D', '1 33766U 97051CA  24001.50000000  .00000420  00000+0  65200-4 0  9997', '2 33766  86.3900 260.1780 0013400 317.8900  42.1350 14.50199002  3', 'debris'],
+  ['SIM-IRIDIUM-E', '1 33766U 97051CA  24001.50000000  .00000420  00000+0  65200-4 0  9997', '2 33766  86.3900 120.1700 0013400 317.8900 292.1200 14.50199002  3', 'debris'],
+  ['SIM-IRIDIUM-F', '1 33766U 97051CA  24001.50000000  .00000420  00000+0  65200-4 0  9997', '2 33766  86.3900 180.1700 0013400 317.8900  52.1200 14.50199002  3', 'debris'],
+  ['SIM-IRIDIUM-G', '1 33766U 97051CA  24001.50000000  .00000420  00000+0  65200-4 0  9997', '2 33766  86.3900 230.1700 0013400 317.8900 132.1200 14.50199002  3', 'debris'],
+  ['SIM-FENGYUN-A', '1 29228U 99025AMK 24001.50000000  .00000150  00000+0  24800-4 0  9993', '2 29228  98.9200 196.1300 0060300 289.3400  70.3200 14.12521901  3', 'debris'],
+  ['SIM-FENGYUN-B', '1 29228U 99025AMK 24001.50000000  .00000150  00000+0  24800-4 0  9993', '2 29228  98.9200 196.1500 0060300 289.3400  70.3600 14.12521901  3', 'debris'],
+  ['SIM-FENGYUN-C', '1 29228U 99025AMK 24001.50000000  .00000150  00000+0  24800-4 0  9993', '2 29228  98.9200 326.1300 0060300 289.3400 230.3200 14.12521901  3', 'debris'],
+  ['SIM-FENGYUN-D', '1 29228U 99025AMK 24001.50000000  .00000150  00000+0  24800-4 0  9993', '2 29228  98.9200  36.1300 0060300 289.3400 310.3200 14.12521901  3', 'debris'],
+  ['SIM-FENGYUN-E', '1 29228U 99025AMK 24001.50000000  .00000150  00000+0  24800-4 0  9993', '2 29228  98.9200 106.1300 0060300 289.3400  10.3200 14.12521901  3', 'debris'],
+  ['SIM-FENGYUN-F', '1 29228U 99025AMK 24001.50000000  .00000150  00000+0  24800-4 0  9993', '2 29228  98.9200 166.1300 0060300 289.3400  90.3200 14.12521901  3', 'debris'],
+];
+
+const CACHE_TTL_MS = 5 * 60 * 60 * 1000; // TLEs update ~daily; refetch after 5h
+const CACHE_PREFIX = 'orbitwatch_tle_';
+
+function readCache(key) {
+  try {
+    const raw = localStorage.getItem(CACHE_PREFIX + key);
+    return raw ? JSON.parse(raw) : null;
+  } catch {
+    return null;
+  }
+}
+
+function writeCache(key, data) {
+  try {
+    localStorage.setItem(CACHE_PREFIX + key, JSON.stringify(data));
+  } catch {
+    // storage unavailable/full — just skip caching, live fetch still works
+  }
+}
+
+function parse3LE(text) {
+  const lines = text.trim().split('\n').map((l) => l.trimEnd());
+  const out = [];
+  for (let i = 0; i + 2 < lines.length; i += 3) {
+    if (lines[i + 1]?.startsWith('1 ') && lines[i + 2]?.startsWith('2 ')) {
+      out.push([lines[i].trim(), lines[i + 1], lines[i + 2]]);
+    }
+  }
+  return out;
+}
+
+async function fetchGroup({ key, url, cap }) {
+  const cached = readCache(key);
+  const cacheAge = cached ? Date.now() - cached.timestamp : Infinity;
+
+  if (cached && cacheAge < CACHE_TTL_MS) {
+    return { key, tles: cached.tles, stale: false, ageMs: cacheAge };
+  }
+
+  try {
+    const res = await fetch(url, { signal: AbortSignal.timeout(8000) });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const text = await res.text();
+    let tles = parse3LE(text);
+    if (!tles.length) throw new Error('empty response');
+    if (cap) tles = tles.slice(0, cap);
+    writeCache(key, { tles, timestamp: Date.now() });
+    return { key, tles, stale: false, ageMs: 0 };
+  } catch (e) {
+    if (cached) {
+      // Network/API failure — fall back to last good cache rather than
+      // blanking the dashboard, but flag it so the UI can say so.
+      return { key, tles: cached.tles, stale: true, ageMs: cacheAge };
+    }
+    return { key, tles: [], stale: true, ageMs: null };
+  }
+}
+
+// Fetches all tracked groups in parallel. Returns TLE triples tagged with
+// their group's object type (debris fields and Starlink are unambiguous by
+// source, more reliable than sniffing the name) plus overall staleness.
+export async function fetchObjects() {
+  const results = await Promise.all(CELESTRAK_GROUPS.map(fetchGroup));
+
+  const tles = [];
+  let stale = false;
+  let hasData = false;
+
+  results.forEach((r, idx) => {
+    const type = CELESTRAK_GROUPS[idx].type;
+    if (r.tles.length) hasData = true;
+    if (r.stale) stale = true;
+    r.tles.forEach(([name, l1, l2]) => tles.push([name, l1, l2, type]));
+  });
+
+  return {
+    tles,
+    stale,
+    hasData,
+    groups: results.map((r) => ({ key: r.key, stale: r.stale, ageMs: r.ageMs, count: r.tles.length })),
+  };
+}
+
+const DEBRIS_KEYWORDS = ['DEB', 'R/B', 'DEBRIS', 'ROCKET', 'FRAG', 'OBJ'];
+
+export function classifyType(name) {
+  return DEBRIS_KEYWORDS.some((k) => name.toUpperCase().includes(k))
+    ? 'debris'
+    : 'satellite';
+}
+
+// Build satellite records from TLE tuples ([name, line1, line2, type?])
+export function buildSatellites(tleArray) {
+  const sats = [];
+  tleArray.forEach(([name, line1, line2, forcedType], idx) => {
+    try {
+      const satrec = satellite.twoline2satrec(line1, line2);
+      sats.push({
+        id: idx,
+        name: name.trim(),
+        satrec,
+        type: forcedType || classifyType(name),
+        inclination: (satrec.inclo * 180) / Math.PI,
+        periodMin: (2 * Math.PI) / satrec.no,
+      });
+    } catch (e) {
+      console.warn('TLE parse failed:', name);
+    }
+  });
+  return sats;
+}
+
+// Julian date (as used in TLEs / satrec.jdsatepoch) -> JS Date
+export function julianToDate(jd) {
+  return new Date((jd - 2440587.5) * 86400000);
+}
+
+// The TLE epoch a satellite record is valid around — propagating far from
+// this date makes SGP4 output meaningless (drag/perturbation error compounds).
+// We anchor the simulation clock to this instead of wall-clock "now" so
+// display stays physically correct even if the cache is a few hours stale.
+export function meanEpochDate(sats) {
+  if (!sats.length) return new Date();
+  const avgJd = sats.reduce((sum, s) => sum + s.satrec.jdsatepoch, 0) / sats.length;
+  return julianToDate(avgJd);
+}
+
+// Get geodetic + cartesian position at a given JS Date
+export function getPosition(satrec, date) {
+  const pv = satellite.propagate(satrec, date);
+  if (!pv.position) return null;
+  const gmst = satellite.gstime(date);
+  const geo = satellite.eciToGeodetic(pv.position, gmst);
+  const lat = satellite.degreesLat(geo.latitude);
+  const lon = satellite.degreesLong(geo.longitude);
+  const altKm = geo.height;
+  if (isNaN(lat) || isNaN(lon) || isNaN(altKm)) return null;
+
+  const speed = pv.velocity
+    ? Math.sqrt(pv.velocity.x ** 2 + pv.velocity.y ** 2 + pv.velocity.z ** 2)
+    : 0;
+
+  return {
+    cartesian: Cesium.Cartesian3.fromDegrees(lon, lat, altKm * 1000),
+    lat,
+    lon,
+    altKm,
+    speedKms: speed,
+  };
+}
+
+// Compute one full orbit path as an array of Cartesian3
+export function computeOrbitPath(satrec, startDate, steps = 90) {
+  const positions = [];
+  const periodSec = ((2 * Math.PI) / satrec.no) * 60;
+  const step = periodSec / steps;
+  for (let i = 0; i <= steps; i++) {
+    const t = new Date(startDate.getTime() + i * step * 1000);
+    const p = getPosition(satrec, t);
+    if (p) positions.push(p.cartesian);
+  }
+  return positions;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Conjunction detection
+//
+// Two-pass search per candidate pair:
+//   1. Coarse scan across the whole window (60-120s steps) to find the
+//      approximate time of closest approach.
+//   2. If that coarse minimum is inside the candidate threshold, refine with
+//      a fine-grained scan (~1s steps) in a window around it to pin down the
+//      true TCA and miss distance.
+// Pairs are pre-filtered by perigee/apogee altitude-band overlap so the
+// expensive refine step only runs on pairs that could plausibly get close —
+// full pairwise coverage at full precision is not tractable in-browser.
+// ─────────────────────────────────────────────────────────────────────────────
+export const RISK_THRESHOLDS = {
+  criticalKm: 2,
+  warningKm: 10,
+};
+const CANDIDATE_KM = 50; // coarse-pass trigger for running the refine pass
+
+const MU_EARTH = 398600.4418; // km^3/s^2
+
+// Cheap radial extent [perigee, apogee] in km from mean elements — used only
+// to pre-filter pairs, not for the actual distance calculation.
+function altitudeBand(satrec) {
+  const n = satrec.no / 60; // rad/s
+  const a = Math.cbrt(MU_EARTH / (n * n));
+  return [a * (1 - satrec.ecco), a * (1 + satrec.ecco)];
+}
+
+function prefilterPairs(sats) {
+  const bands = sats.map((s) => altitudeBand(s.satrec));
+  const pairs = [];
+  for (let i = 0; i < sats.length; i++) {
+    for (let j = i + 1; j < sats.length; j++) {
+      const [rp1, ra1] = bands[i];
+      const [rp2, ra2] = bands[j];
+      if (rp1 - CANDIDATE_KM <= ra2 + CANDIDATE_KM && rp2 - CANDIDATE_KM <= ra1 + CANDIDATE_KM) {
+        pairs.push([i, j]);
+      }
+    }
+  }
+  return pairs;
+}
+
+// True 3D separation in the inertial (ECI) frame — this is the actual
+// physical distance between the two objects at that instant, no need to
+// round-trip through geodetic coordinates the way getPosition() does for
+// globe rendering.
+function eciDistanceKm(satrecA, satrecB, date) {
+  const pvA = satellite.propagate(satrecA, date);
+  const pvB = satellite.propagate(satrecB, date);
+  if (!pvA.position || !pvB.position) return null;
+  const dx = pvA.position.x - pvB.position.x;
+  const dy = pvA.position.y - pvB.position.y;
+  const dz = pvA.position.z - pvB.position.z;
+  return Math.sqrt(dx * dx + dy * dy + dz * dz);
+}
+
+function relativeVelocityKmS(satrecA, satrecB, date) {
+  const pvA = satellite.propagate(satrecA, date);
+  const pvB = satellite.propagate(satrecB, date);
+  if (!pvA.velocity || !pvB.velocity) return null;
+  const dx = pvA.velocity.x - pvB.velocity.x;
+  const dy = pvA.velocity.y - pvB.velocity.y;
+  const dz = pvA.velocity.z - pvB.velocity.z;
+  return Math.sqrt(dx * dx + dy * dy + dz * dz);
+}
+
+function classifyRisk(distKm) {
+  if (distKm < RISK_THRESHOLDS.criticalKm) return 'critical';
+  if (distKm < RISK_THRESHOLDS.warningKm) return 'warning';
+  return null;
+}
+
+// Async + yields periodically so a few hundred candidate pairs don't block
+// the main thread for seconds at a stretch — this runs on TLE refresh and on
+// a wall-clock timer, never on every scrubber tick.
+export async function computeConjunctions(sats, centerDate, {
+  hoursBack = 1,
+  hoursAhead = 48,
+  coarseStepSec = 90,
+  refineWindowSec = 180,
+  refineStepSec = 1,
+  yieldEveryPairs = 25,
+} = {}) {
+  if (sats.length < 2) return [];
+
+  const windowStart = new Date(centerDate.getTime() - hoursBack * 3600000);
+  const totalSec = (hoursBack + hoursAhead) * 3600;
+  const candidatePairs = prefilterPairs(sats);
+
+  const results = [];
+  for (let idx = 0; idx < candidatePairs.length; idx++) {
+    const [i, j] = candidatePairs[idx];
+    const satrecA = sats[i].satrec;
+    const satrecB = sats[j].satrec;
+
+    let bestT = 0;
+    let bestD = Infinity;
+    for (let t = 0; t <= totalSec; t += coarseStepSec) {
+      const d = eciDistanceKm(satrecA, satrecB, new Date(windowStart.getTime() + t * 1000));
+      if (d !== null && d < bestD) {
+        bestD = d;
+        bestT = t;
+      }
+    }
+
+    if (bestD < CANDIDATE_KM) {
+      let refinedD = bestD;
+      let refinedT = bestT;
+      const lo = Math.max(0, bestT - refineWindowSec);
+      const hi = Math.min(totalSec, bestT + refineWindowSec);
+      for (let t = lo; t <= hi; t += refineStepSec) {
+        const d = eciDistanceKm(satrecA, satrecB, new Date(windowStart.getTime() + t * 1000));
+        if (d !== null && d < refinedD) {
+          refinedD = d;
+          refinedT = t;
+        }
+      }
+
+      const riskLevel = classifyRisk(refinedD);
+      if (riskLevel) {
+        const tca = new Date(windowStart.getTime() + refinedT * 1000);
+        results.push({
+          i, j,
+          name1: sats[i].name,
+          name2: sats[j].name,
+          distKm: refinedD,
+          time: tca,
+          riskLevel,
+          relativeVelocityKmS: relativeVelocityKmS(satrecA, satrecB, tca),
+        });
+      }
+    }
+
+    if (idx % yieldEveryPairs === yieldEveryPairs - 1) {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+  }
+
+  return results.sort((a, b) => a.distKm - b.distKm);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Altitude density buckets — for the heatmap ring.
+// Returns [{ band, label, count }] grouped by altitude range.
+// ─────────────────────────────────────────────────────────────────────────────
+export function computeAltitudeDensity(sats, date) {
+  const bands = [
+    { min: 0,    max: 500,   label: '< 500 km' },
+    { min: 500,  max: 800,   label: '500–800 km' },
+    { min: 800,  max: 1200,  label: '800–1200 km' },
+    { min: 1200, max: 2000,  label: '1200–2000 km' },
+    { min: 2000, max: 99999, label: '> 2000 km' },
+  ];
+  const counts = bands.map((b) => ({ ...b, count: 0 }));
+  sats.forEach((s) => {
+    const p = getPosition(s.satrec, date);
+    if (!p) return;
+    const band = counts.find((b) => p.altKm >= b.min && p.altKm < b.max);
+    if (band) band.count++;
+  });
+  return counts;
+}
