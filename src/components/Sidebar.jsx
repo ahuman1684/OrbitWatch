@@ -1,4 +1,5 @@
 import { useState, useMemo, useRef, useEffect } from 'react';
+import { DEMO_SCENARIOS, RISK_THRESHOLDS } from '../lib/orbital';
 
 export default function Sidebar({ cesium, showDensity, setShowDensity }) {
   const [query, setQuery] = useState('');
@@ -71,8 +72,30 @@ export default function Sidebar({ cesium, showDensity, setShowDensity }) {
         </button>
       </div>
 
+      {cesium.dataSource === 'demo' && (
+        <div className="scenario-row">
+          <select
+            className="scenario-select"
+            value={cesium.demoScenario}
+            onChange={(e) => cesium.setDemoScenario(e.target.value)}
+            aria-label="Demo scenario"
+          >
+            {Object.entries(DEMO_SCENARIOS).map(([key, s]) => (
+              <option key={key} value={key}>{s.label}</option>
+            ))}
+          </select>
+          <button
+            className="play-demo-btn"
+            onClick={() => (cesium.playingDemo ? cesium.stopDemo() : cesium.playDemo())}
+            disabled={!cesium.conjunctions.length}
+          >
+            {cesium.playingDemo ? '■ Stop' : '▶ Play Demo'}
+          </button>
+        </div>
+      )}
+
       {cesium.dataSource === 'demo' ? (
-        <div className="stale-indicator demo">◆ Demo dataset — 30 fixed objects, guaranteed conjunctions, no network</div>
+        <div className="stale-indicator demo">◆ {DEMO_SCENARIOS[cesium.demoScenario].description}</div>
       ) : !cesium.hasData ? (
         <div className="stale-indicator">⚠ Live orbital data unavailable — check network connection</div>
       ) : cesium.dataStale ? (
@@ -119,9 +142,15 @@ export default function Sidebar({ cesium, showDensity, setShowDensity }) {
       </div>
 
       <div className="risk-legend">
-        <span className="legend-item"><span className="legend-dot dot-critical" />Critical</span>
-        <span className="legend-item"><span className="legend-dot dot-warning" />Warning</span>
-        <span className="legend-item"><span className="legend-dot dot-debris" />Debris</span>
+        <span className="legend-item" title={`Miss distance < ${RISK_THRESHOLDS.criticalKm} km`}>
+          <span className="legend-dot dot-critical" />Critical
+        </span>
+        <span className="legend-item" title={`Miss distance ${RISK_THRESHOLDS.criticalKm}–${RISK_THRESHOLDS.warningKm} km`}>
+          <span className="legend-dot dot-warning" />Warning
+        </span>
+        <span className="legend-item" title="Debris / rocket body">
+          <span className="legend-dot dot-debris" />Debris
+        </span>
       </div>
 
       <div className="search-reveal-wrap" ref={wrapRef}>
@@ -154,7 +183,7 @@ export default function Sidebar({ cesium, showDensity, setShowDensity }) {
                   ))}
                 </div>
               ) : tab === 'conjunctions' ? (
-                <ConjunctionList conjunctions={filteredConjunctions} simTime={cesium.simTime} onFocus={cesium.flyToConjunction} />
+                <ConjunctionList conjunctions={filteredConjunctions} simTime={cesium.simTime} onFocus={cesium.selectConjunction} />
               ) : (
                 <ObjectList sats={filteredSats} onFocus={cesium.flyToSat} />
               )}

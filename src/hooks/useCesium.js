@@ -5,9 +5,11 @@ import {
   buildSatellites,
   getPosition,
   computeOrbitPath,
+  computeGroundTrack,
   computeConjunctions,
   meanEpochDate,
-  DEMO_TLES,
+  simulateNudge,
+  DEMO_SCENARIOS,
 } from '../lib/orbital';
 
 // TLE cache TTL is a few hours; re-check on this cadence so a refresh is
@@ -182,7 +184,13 @@ export function useCesium(containerRef) {
   const conjTokenRef    = useRef(0);           // guards overlapping/stale conjunction computations
   const highlightedIdRef = useRef(null);       // sat id whose trajectory is highlighted (selected)
   const dataSourceRef   = useRef('live');      // 'live' | 'demo' — read inside closures/timers
+  const demoScenarioRef = useRef('mixed');     // key into DEMO_SCENARIOS — read inside closures
   const refreshFnRef    = useRef(null);        // set once the init effect defines refreshData
+  const groundTrackRef  = useRef(null);        // single ground-track polyline (selected object only)
+  const trailRef        = useRef(null);        // single comet-trail polyline (selected object only)
+  const trailPointsRef  = useRef([]);          // rolling recent-position buffer for the trail
+  const playTimersRef   = useRef([]);          // pending timeouts for the guided demo sequence
+  const conjunctionsRef = useRef([]);          // kept in sync with `conjunctions` state for use in delayed callbacks
 
   const [loading, setLoading]           = useState(true);
   const [satellites, setSatellites]     = useState([]);
@@ -190,10 +198,13 @@ export function useCesium(containerRef) {
   const [simTime, setSimTime]           = useState(new Date());
   const [epochTime, setEpochTime]       = useState(null);
   const [selected, setSelected]         = useState(null);
+  const [selectedConjunction, setSelectedConjunction] = useState(null);
   const [imagerySource, setImagerySource] = useState(null); // 'esri' | 'offline'
   const [dataStale, setDataStale]       = useState(false);
   const [hasData, setHasData]           = useState(true); // false only once a load has actually failed
   const [dataSource, setDataSource]     = useState('live'); // 'live' | 'demo'
+  const [demoScenario, setDemoScenarioState] = useState('mixed'); // key into DEMO_SCENARIOS
+  const [playingDemo, setPlayingDemo]   = useState(false);
 
   // toggles
   const [showOrbits, setShowOrbits]         = useState(true);
@@ -259,7 +270,7 @@ export function useCesium(containerRef) {
     async function refreshData(isFirstLoad, source) {
       let tles, stale, gotData;
       if (source === 'demo') {
-        tles = DEMO_TLES;
+        tles = DEMO_SCENARIOS[demoScenarioRef.current].tles;
         stale = false;
         gotData = true;
       } else {
@@ -295,7 +306,12 @@ export function useCesium(containerRef) {
       if (isFirstLoad || countChanged) {
         renderEntities(viewer, sats, anchor);
         setSelected(null); // old selection may reference a destroyed entity
+        setSelectedConjunction(null);
         highlightedIdRef.current = null;
+        // Not tracked in entityMapRef/orbitMapRef, so renderEntities() doesn't
+        // clean these up — clear explicitly or they're orphaned on rebuild.
+        clearGroundTrack(viewer);
+        clearTrail(viewer);
       }
 
       // Conjunction detection is decoupled from the scrubber. For live data
@@ -325,6 +341,11 @@ export function useCesium(containerRef) {
           lastTickRef.current = t.getTime();
           updatePositions(satsRef.current, t);
           updateConjunctionLines(satsRef.current, t);
+          if (highlightedIdRef.current !== null) {
+            const sat = satsRef.current.find((s) => s.id === highlightedIdRef.current);
+            const pos = sat && getPosition(sat.satrec, t);
+            if (pos) updateTrail(viewer, pos.cartesian);
+          }
           setSimTime(new Date(t));
         }
       });
@@ -390,6 +411,63 @@ export function useCesium(containerRef) {
       });
       orbitMapRef.current.set(sat.id, orbit);
     });
+  }
+
+  // ── Ground track + comet trail — richer detail for whatever's selected,
+  // rather than more always-on clutter across every object. ──────────────
+  function showGroundTrack(viewer, sat, now) {
+    clearGroundTrack(viewer);
+    if (!sat) return;
+    groundTrackRef.current = viewer.entities.add({
+      polyline: {
+        positions: computeGroundTrack(sat.satrec, now),
+        width: 1.5,
+        material: new Cesium.PolylineDashMaterialProperty({
+          color: Cesium.Color.WHITE.withAlpha(0.5),
+          dashLength: 6,
+        }),
+        arcType: Cesium.ArcType.NONE,
+        clampToGround: false,
+      },
+    });
+  }
+
+  function clearGroundTrack(viewer) {
+    if (groundTrackRef.current) {
+      viewer.entities.remove(groundTrackRef.current);
+      groundTrackRef.current = null;
+    }
+  }
+
+  function updateTrail(viewer, cartesianPosition) {
+    const buf = trailPointsRef.current;
+    buf.push(cartesianPosition);
+    if (buf.length > 30) buf.shift();
+    if (buf.length < 2) return;
+
+    if (trailRef.current) {
+      trailRef.current.polyline.positions = buf.slice();
+    } else {
+      trailRef.current = viewer.entities.add({
+        polyline: {
+          positions: buf.slice(),
+          width: 3,
+          material: new Cesium.PolylineGlowMaterialProperty({
+            glowPower: 0.28,
+            color: Cesium.Color.WHITE.withAlpha(0.85),
+          }),
+          arcType: Cesium.ArcType.NONE,
+        },
+      });
+    }
+  }
+
+  function clearTrail(viewer) {
+    trailPointsRef.current = [];
+    if (trailRef.current) {
+      viewer.entities.remove(trailRef.current);
+      trailRef.current = null;
+    }
   }
 
   function updatePositions(sats, now) {
@@ -466,6 +544,16 @@ export function useCesium(containerRef) {
     refreshFnRef.current(true, source);
   }, []);
 
+  const setDemoScenario = useCallback((key) => {
+    if (demoScenarioRef.current === key || !DEMO_SCENARIOS[key]) return;
+    demoScenarioRef.current = key;
+    setDemoScenarioState(key);
+    if (dataSourceRef.current === 'demo' && refreshFnRef.current) {
+      setLoading(true);
+      refreshFnRef.current(true, 'demo');
+    }
+  }, []);
+
   const setSpeed = useCallback((mult) => {
     if (viewerRef.current) viewerRef.current.clock.multiplier = mult;
   }, []);
@@ -494,6 +582,59 @@ export function useCesium(containerRef) {
     const e2 = entityMapRef.current.get(conj.j);
     if (e2) e2.label.show = true;
   }, [flyToSat]);
+
+  // Focuses a conjunction AND marks it "active" for the detail/mitigation
+  // panel — flyToConjunction alone (used by search results etc.) doesn't.
+  const selectConjunction = useCallback((conj) => {
+    setSelectedConjunction(conj);
+    flyToConjunction(conj);
+  }, [flyToConjunction]);
+
+  // Illustrative what-if: nudge object A of the active conjunction along its
+  // own velocity direction by `nudgeMeters` and report the resulting miss
+  // distance/Pc. Not a real burn simulation — see simulateNudge's own doc.
+  const simulateMitigation = useCallback((nudgeMeters) => {
+    if (!selectedConjunction) return null;
+    const satA = satsRef.current.find((s) => s.id === selectedConjunction.i);
+    const satB = satsRef.current.find((s) => s.id === selectedConjunction.j);
+    if (!satA || !satB) return null;
+    return simulateNudge(satA.satrec, satB.satrec, selectedConjunction.time, nudgeMeters);
+  }, [selectedConjunction]);
+
+  const stopDemo = useCallback(() => {
+    playTimersRef.current.forEach(clearTimeout);
+    playTimersRef.current = [];
+    setPlayingDemo(false);
+  }, []);
+
+  // Short guided showcase: focus the most severe conjunction in the current
+  // demo scenario, hold, then return to the overview. Deliberately modest in
+  // scope (2 beats, not a long scripted tour) so it stays robust rather than
+  // depending on a chain of camera-fly animations completing exactly on time.
+  const playDemo = useCallback(() => {
+    stopDemo();
+    const worst = conjunctionsRef.current[0]; // already sorted by distance
+    if (!worst) return;
+    setPlayingDemo(true);
+
+    const schedule = (fn, delay) => {
+      playTimersRef.current.push(setTimeout(fn, delay));
+    };
+    schedule(() => selectConjunction(worst), 700);
+    schedule(() => {
+      setSelected(null);
+      setSelectedConjunction(null);
+      setPlayingDemo(false);
+    }, 7000);
+  }, [stopDemo, selectConjunction]);
+
+  useEffect(() => {
+    conjunctionsRef.current = conjunctions;
+  }, [conjunctions]);
+
+  // Cancel any pending guided-demo steps on unmount so they don't fire
+  // setState calls against a torn-down component.
+  useEffect(() => () => playTimersRef.current.forEach(clearTimeout), []);
 
   // ── Toggle effects ──────────────────────────────────────────────────────
   // Single source of truth for per-entity visibility: type filters (Debris/
@@ -547,6 +688,10 @@ export function useCesium(containerRef) {
         e.point.outlineWidth = 2;
       }
       highlightedIdRef.current = null;
+      if (viewerRef.current) {
+        clearGroundTrack(viewerRef.current);
+        clearTrail(viewerRef.current);
+      }
     }
 
     if (selected) {
@@ -561,6 +706,10 @@ export function useCesium(containerRef) {
         e.point.outlineWidth = 3;
       }
       highlightedIdRef.current = selected.id;
+      if (viewerRef.current && highlightedIdRef.current !== prevId) {
+        trailPointsRef.current = [];
+        showGroundTrack(viewerRef.current, selected, simTime);
+      }
     }
   }, [selected, conjunctions]);
 
@@ -572,16 +721,24 @@ export function useCesium(containerRef) {
     epochTime,
     selected,
     setSelected,
+    selectedConjunction,
     imagerySource,
     dataStale,
     hasData,
     dataSource,
+    demoScenario,
+    playingDemo,
     // actions
     switchDataSource,
+    setDemoScenario,
     setSpeed,
     jumpToTime,
     flyToSat,
     flyToConjunction,
+    selectConjunction,
+    simulateMitigation,
+    playDemo,
+    stopDemo,
     // toggles
     showOrbits, setShowOrbits,
     showDebris, setShowDebris,
