@@ -1,5 +1,8 @@
 import * as satellite from 'satellite.js';
 import * as Cesium from 'cesium';
+// Last-resort fallback for live mode — see fetchGroup(). Regenerate with
+// `node scripts/fetch-tle-snapshot.mjs`; empty until that has been run.
+import TLE_SNAPSHOT from '../data/tleSnapshot.json';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Live orbital data — CelesTrak GP (TLE) API, no auth required.
@@ -209,6 +212,20 @@ async function fetchGroup({ key, url, cap }) {
       // blanking the dashboard, but flag it so the UI can say so.
       return { key, tles: cached.tles, stale: true, ageMs: now - cached.timestamp };
     }
+    // No cache either (first ever visit, or cleared storage). Rather than show
+    // an empty globe, fall back to the TLE snapshot committed with the build.
+    // It is real catalogue data, just fixed at its capture date — the UI says
+    // so explicitly and shows that date, so it is never mistaken for live.
+    const snap = TLE_SNAPSHOT.groups?.[key];
+    if (snap?.length) {
+      return {
+        key,
+        tles: cap ? snap.slice(0, cap) : snap,
+        stale: true,
+        ageMs: null,
+        fromSnapshot: true,
+      };
+    }
     return { key, tles: [], stale: true, ageMs: null };
   }
 }
@@ -244,11 +261,13 @@ export async function fetchObjects() {
   const tles = [];
   let stale = false;
   let hasData = false;
+  let usedSnapshot = false;
 
   results.forEach((r, idx) => {
     const type = CELESTRAK_GROUPS[idx].type;
     if (r.tles.length) hasData = true;
     if (r.stale) stale = true;
+    if (r.fromSnapshot) usedSnapshot = true;
     r.tles.forEach(([name, l1, l2]) => tles.push([name, l1, l2, type]));
   });
 
@@ -256,6 +275,8 @@ export async function fetchObjects() {
     tles,
     stale,
     hasData,
+    usedSnapshot,
+    snapshotCapturedAt: usedSnapshot ? TLE_SNAPSHOT.capturedAt : null,
     groups: results.map((r) => ({ key: r.key, stale: r.stale, ageMs: r.ageMs, count: r.tles.length })),
   };
 }

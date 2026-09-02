@@ -1,0 +1,5 @@
+{
+  "capturedAt": null,
+  "note": "Fallback only. Regenerate with: node scripts/fetch-tle-snapshot.mjs",
+  "groups": {}
+}

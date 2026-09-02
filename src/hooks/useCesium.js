@@ -202,6 +202,9 @@ export function useCesium(containerRef) {
   const [imagerySource, setImagerySource] = useState(null); // 'esri' | 'offline'
   const [dataStale, setDataStale]       = useState(false);
   const [hasData, setHasData]           = useState(true); // false only once a load has actually failed
+  // Capture date of the bundled snapshot, set only when live + cache both
+  // failed and we fell back to it — so the UI can label the data honestly.
+  const [snapshotCapturedAt, setSnapshotCapturedAt] = useState(null);
   const [dataSource, setDataSource]     = useState('live'); // 'live' | 'demo'
   const [demoScenario, setDemoScenarioState] = useState('mixed'); // key into DEMO_SCENARIOS
   const [playingDemo, setPlayingDemo]   = useState(false);
@@ -268,7 +271,7 @@ export function useCesium(containerRef) {
     // conjunctions. Called on mount, on a wall-clock timer (live only), and
     // whenever switchDataSource() swaps live/demo — never tied to simTime.
     async function refreshData(isFirstLoad, source) {
-      let tles, stale, gotData;
+      let tles, stale, gotData, snapshotAt = null;
       if (source === 'demo') {
         tles = DEMO_SCENARIOS[demoScenarioRef.current].tles;
         stale = false;
@@ -278,11 +281,13 @@ export function useCesium(containerRef) {
         tles = result.tles;
         stale = result.stale;
         gotData = result.hasData;
+        snapshotAt = result.usedSnapshot ? result.snapshotCapturedAt : null;
       }
       if (viewerRef.current !== viewer) return; // unmounted before fetch resolved
 
       setDataStale(stale);
       setHasData(gotData);
+      setSnapshotCapturedAt(snapshotAt);
 
       const sats = buildSatellites(tles);
       const countChanged = sats.length !== satsRef.current.length;
@@ -725,6 +730,7 @@ export function useCesium(containerRef) {
     imagerySource,
     dataStale,
     hasData,
+    snapshotCapturedAt,
     dataSource,
     demoScenario,
     playingDemo,

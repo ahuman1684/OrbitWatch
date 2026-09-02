@@ -98,6 +98,11 @@ export default function Sidebar({ cesium, showDensity, setShowDensity }) {
         <div className="stale-indicator demo">◆ {DEMO_SCENARIOS[cesium.demoScenario].description}</div>
       ) : !cesium.hasData ? (
         <div className="stale-indicator">⚠ Live orbital data unavailable — check network connection</div>
+      ) : cesium.snapshotCapturedAt ? (
+        <div className="stale-indicator">
+          ⚠ Live fetch unavailable — showing bundled catalogue snapshot from{' '}
+          {new Date(cesium.snapshotCapturedAt).toISOString().slice(0, 10)}
+        </div>
       ) : cesium.dataStale ? (
         <div className="stale-indicator">⚠ Showing cached TLE data — live refresh unavailable</div>
       ) : null}
