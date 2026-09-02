@@ -33,7 +33,16 @@ Real TLEs (Two-Line Elements) fetched directly from **CelesTrak's GP API**, no a
 
 Each group is capped because conjunction detection is O(pairs), and debris fields in particular cluster tightly in altitude — raw object count matters more than pair count for keeping the browser responsive.
 
-Requests are routed through a local dev-server proxy (`/celestrak-proxy`, configured in `vite.config.js`) rather than hitting `celestrak.org` directly, because CelesTrak doesn't send CORS headers — a direct browser `fetch()` fails silently otherwise. The proxy rewrites `/celestrak-proxy/*` to `https://celestrak.org/NORAD/elements/*` server-side, which sidesteps CORS entirely since it becomes a server-to-server request. **This only applies during `npm run dev`/`npm run preview` — a static production deploy would need an equivalent server-side proxy or a hosted CORS-passthrough.**
+Requests go **directly to `celestrak.org` from the browser** — it serves `Access-Control-Allow-Origin: *`, so no proxy is needed.
+
+Earlier versions routed through a Vite dev-server proxy on the assumption that CelesTrak sent no CORS headers. That proxy was removed, because it actively broke production. CelesTrak budgets requests **per IP** and enforces it by dropping packets — TCP connects, then the request hangs until it times out, rather than returning a 403. Proxying makes every visitor's request originate from the one host IP, so the whole user base shares a single budget and exhausts it almost immediately. That is exactly what happened on Render:
+
+```
+[vite] http proxy error: /NORAD/elements/gp.php?GROUP=starlink&FORMAT=3LE
+Error: connect ETIMEDOUT 104.168.149.178:443
+```
+
+Fetching client-side sends each request from the visitor's own IP, so the per-IP budget is spread across users instead of being concentrated. It also means the app deploys as **pure static files with no server component at all**.
 
 ### 2.2 Caching + "fetch as soon as it's actually fresh"
 
@@ -270,6 +279,6 @@ src/
 
 - **Estimated Pc, not rigorous Pc** — see §5.2. This is a real, disclosed limitation of working from public TLE data, not an oversight.
 - **Mitigation simulator is geometric, not a real burn** — see §6.
-- **The CelesTrak proxy is dev-server-only** (`vite.config.js`'s `server.proxy`/`preview.proxy`) — a production static deploy needs an equivalent server-side proxy.
+- **CelesTrak throttles per IP, and does it by timing out rather than refusing** — a burst of requests from one address gets tarpitted for a while. The app fetches client-side (spreading load across visitors' own IPs) and falls back to cache on timeout, but a single user who hard-refreshes repeatedly can still throttle themselves temporarily. Demo Mode is unaffected.
 - **Demo scenarios are fixed, not regenerated per session** — a deliberate reliability tradeoff (see §3.1), not a missing feature.
 - **Ground track/comet trail render for the selected object only** — an intentional declutter choice, not a performance ceiling that couldn't be raised.

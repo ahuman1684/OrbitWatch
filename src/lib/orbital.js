@@ -7,22 +7,32 @@ import * as Cesium from 'cesium';
 // and debris fields in particular cluster tightly in altitude, so raw object
 // count (not just pair count) is the thing to keep in check.
 //
-// URLs are routed through /celestrak-proxy (see vite.config.js) rather than
-// hitting celestrak.org directly — CelesTrak doesn't send CORS headers, so a
-// direct browser fetch fails silently into the cache/empty fallback path.
+// Fetched straight from celestrak.org: it serves `Access-Control-Allow-Origin: *`,
+// so the browser can read it cross-origin with no proxy in between.
+//
+// This deliberately does NOT go through a server-side proxy. CelesTrak budgets
+// requests per IP and enforces it by dropping packets — TCP connects, then the
+// request hangs until it times out, rather than returning a 403. A proxy makes
+// every visitor's request originate from the one host IP, so the whole user base
+// shares a single budget and exhausts it almost immediately; that is what broke
+// the Render deployment (ETIMEDOUT on every group). Fetching from the browser
+// sends each request from that visitor's own IP, and lets the app deploy as pure
+// static files with no server component at all.
 // ─────────────────────────────────────────────────────────────────────────────
+const CELESTRAK_BASE = 'https://celestrak.org/NORAD/elements/gp.php';
+
 const CELESTRAK_GROUPS = [
   // Fengyun-1C has no named GROUP (unlike the other two breakup fields below)
   // — query by international designator instead, which returns the parent
   // object plus every cataloged fragment from the same launch/breakup.
-  { key: 'fengyun',  type: 'debris',    cap: 15, url: '/celestrak-proxy/gp.php?INTDES=1999-025&FORMAT=3LE' },
-  { key: 'cosmos',   type: 'debris',    cap: 15, url: '/celestrak-proxy/gp.php?GROUP=cosmos-2251-debris&FORMAT=3LE' },
-  { key: 'iridium',  type: 'debris',    cap: 15, url: '/celestrak-proxy/gp.php?GROUP=iridium-33-debris&FORMAT=3LE' },
-  { key: 'starlink', type: 'satellite', cap: 40, url: '/celestrak-proxy/gp.php?GROUP=starlink&FORMAT=3LE' },
+  { key: 'fengyun',  type: 'debris',    cap: 15, url: `${CELESTRAK_BASE}?INTDES=1999-025&FORMAT=3LE` },
+  { key: 'cosmos',   type: 'debris',    cap: 15, url: `${CELESTRAK_BASE}?GROUP=cosmos-2251-debris&FORMAT=3LE` },
+  { key: 'iridium',  type: 'debris',    cap: 15, url: `${CELESTRAK_BASE}?GROUP=iridium-33-debris&FORMAT=3LE` },
+  { key: 'starlink', type: 'satellite', cap: 40, url: `${CELESTRAK_BASE}?GROUP=starlink&FORMAT=3LE` },
   // Crewed stations (ISS, Tiangong, ...) and science satellites (Hubble, ...)
   // — so live "satellite" mode isn't just Starlink clones.
-  { key: 'stations', type: 'satellite', cap: 15, url: '/celestrak-proxy/gp.php?GROUP=stations&FORMAT=3LE' },
-  { key: 'science',  type: 'satellite', cap: 15, url: '/celestrak-proxy/gp.php?GROUP=science&FORMAT=3LE' },
+  { key: 'stations', type: 'satellite', cap: 15, url: `${CELESTRAK_BASE}?GROUP=stations&FORMAT=3LE` },
+  { key: 'science',  type: 'satellite', cap: 15, url: `${CELESTRAK_BASE}?GROUP=science&FORMAT=3LE` },
 ];
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -203,11 +213,33 @@ async function fetchGroup({ key, url, cap }) {
   }
 }
 
-// Fetches all tracked groups in parallel. Returns TLE triples tagged with
-// their group's object type (debris fields and Starlink are unambiguous by
-// source, more reliable than sniffing the name) plus overall staleness.
+// Runs `worker` over `items` at most `limit` at a time, preserving input order
+// in the results.
+async function mapWithConcurrency(items, limit, worker) {
+  const results = new Array(items.length);
+  let next = 0;
+  async function run() {
+    while (next < items.length) {
+      const idx = next++;
+      results[idx] = await worker(items[idx]);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, run));
+  return results;
+}
+
+// CelesTrak budgets requests per IP and enforces it by dropping packets, so a
+// burst reads as a timeout rather than a 403. Firing all six groups at once was
+// itself enough of a burst to get tarpitted, so they go out at most two at a
+// time. Cached groups short-circuit inside fetchGroup without touching the
+// network, so this only paces real requests.
+const FETCH_CONCURRENCY = 2;
+
+// Fetches all tracked groups. Returns TLE triples tagged with their group's
+// object type (debris fields and Starlink are unambiguous by source, more
+// reliable than sniffing the name) plus overall staleness.
 export async function fetchObjects() {
-  const results = await Promise.all(CELESTRAK_GROUPS.map(fetchGroup));
+  const results = await mapWithConcurrency(CELESTRAK_GROUPS, FETCH_CONCURRENCY, fetchGroup);
 
   const tles = [];
   let stale = false;
